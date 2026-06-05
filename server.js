@@ -135,7 +135,7 @@ app.post('/conectar/:id', async (req, res) => {
     pendingQRs[id] = null;
     iniciarSesionWhatsApp(id, cliente);
 
-    // Esperar QR hasta 30 segundos
+    // Esperar QR hasta 60 segundos
     var intentos = 0;
     var interval = setInterval(() => {
       intentos++;
@@ -145,7 +145,7 @@ app.post('/conectar/:id', async (req, res) => {
       } else if (activeSessions[id]) {
         clearInterval(interval);
         res.json({ ok: true, conectado: true, mensaje: 'Ya estaba conectado' });
-      } else if (intentos > 30) {
+      } else if (intentos > 60) {
         clearInterval(interval);
         res.status(408).json({ ok: false, error: 'Timeout esperando QR' });
       }
@@ -233,15 +233,22 @@ async function iniciarSesionWhatsApp(clienteId, cliente) {
 
     if (connection === 'close') {
       delete activeSessions[clienteId];
-      var shouldReconnect = lastDisconnect && lastDisconnect.error &&
+      var statusCode = lastDisconnect && lastDisconnect.error &&
         lastDisconnect.error.output &&
-        lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut;
+        lastDisconnect.error.output.statusCode;
+      var shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 403;
 
       if (shouldReconnect) {
         console.log('Reconectando cliente ' + clienteId + '...');
-        setTimeout(() => iniciarSesionWhatsApp(clienteId, cliente), 5000);
+        setTimeout(() => iniciarSesionWhatsApp(clienteId, cliente), 10000);
       } else {
+        console.log('Cliente ' + clienteId + ' desconectado definitivamente');
         await supabase.from('clientes').update({ conectado: false }).eq('id', clienteId);
+        // Limpiar sesion guardada para forzar nuevo QR
+        var authDir = path.join('./sesiones', clienteId.toString());
+        if (fs.existsSync(authDir)) {
+          fs.rmSync(authDir, { recursive: true, force: true });
+        }
       }
     }
   });
