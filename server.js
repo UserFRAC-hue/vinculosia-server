@@ -296,9 +296,31 @@ async function iniciarSesionWhatsApp(clienteId, cliente, intentoReconexion) {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+sock.ev.on('messages.upsert', async ({ messages }) => {
     for (var msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      // Detectar si el dueno escribio manualmente (fromMe = true)
+      if (msg.key.fromMe && msg.message) {
+        var textoHumano = msg.message.conversation || (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '';
+        if (textoHumano && textoHumano.trim().toLowerCase() === '/bot on') {
+          await supabase.from('kv_conversaciones')
+            .update({ modo: 'bot' })
+            .eq('cliente_id', clienteId)
+            .eq('telefono_usuario', msg.key.remoteJid);
+          await sock.sendMessage(msg.key.remoteJid, { text: 'Bot reactivado.' });
+        } else if (textoHumano) {
+          await supabase.from('kv_conversaciones')
+            .upsert([{
+              cliente_id: clienteId,
+              telefono_usuario: msg.key.remoteJid,
+              modo: 'humano',
+              ultimo_mensaje: textoHumano,
+              fecha: new Date().toISOString()
+            }], { onConflict: 'cliente_id,telefono_usuario' });
+        }
+        continue;
+      }
+
+      if (!msg.message) continue;
       var texto = msg.message.conversation || (msg.message.extendedTextMessage && msg.message.extendedTextMessage.text) || '';
       if (!texto) continue;
 
@@ -312,7 +334,16 @@ async function iniciarSesionWhatsApp(clienteId, cliente, intentoReconexion) {
         respondido_ia: false
       }]);
 
-      // Responder con IA si no está suspendido
+      // Verificar si este chat esta en modo humano
+      var { data: conv } = await supabase
+        .from('kv_conversaciones')
+        .select('modo')
+        .eq('cliente_id', clienteId)
+        .eq('telefono_usuario', remitente)
+        .single();
+
+      if (conv && conv.modo === 'humano') continue;
+
       var { data: clienteActual } = await supabase.from('clientes').select('*').eq('id', clienteId).single();
       if (!clienteActual || clienteActual.suspendido) continue;
 
@@ -327,6 +358,16 @@ async function iniciarSesionWhatsApp(clienteId, cliente, intentoReconexion) {
           direccion: 'salida',
           respondido_ia: true
         }]);
+
+        await supabase.from('kv_conversaciones')
+          .upsert([{
+            cliente_id: clienteId,
+            telefono_usuario: remitente,
+            modo: 'bot',
+            ultimo_mensaje: texto,
+            fecha: new Date().toISOString()
+          }], { onConflict: 'cliente_id,telefono_usuario' });
+
       } catch(e) {
         console.error('Error IA cliente ' + clienteId + ':', e.message);
       }
@@ -334,7 +375,83 @@ async function iniciarSesionWhatsApp(clienteId, cliente, intentoReconexion) {
   });
 }
 
+async function obtenerConfigKV(clienteId) {
+  try {
+    // Buscar en kv_clientes por whatsapp coincidente con clientes.telefono
+    var { data: kvCliente } = await supabase
+      .from('kv_clientes')
+      .select('*')
+      .eq('whatsapp', clienteId)
+      .eq('activo', true)
+      .single();
+
+    if (!kvCliente) return null;
+
+    // Obtener configuracion del bot
+    var { data: config } = await supabase
+      .from('kv_configuracion_bot')
+      .select('*')
+      .eq('cliente_id', kvCliente.id)
+      .single();
+
+    // Obtener productos activos
+    var { data: productos } = await supabase
+      .from('kv_productos')
+      .select('nombre, referencia, precio, tallas, colores, stock')
+      .eq('cliente_id', kvCliente.id)
+      .eq('activo', true);
+
+    return { kvCliente, config, productos };
+  } catch(e) {
+    return null;
+  }
+}
+
+function construirSystemPrompt(cliente, kvData) {
+  // Si no tiene Kit de Ventas, usar prompt básico de Vínculos.IA
+  if (!kvData || !kvData.config) {
+    return cliente.prompt_ia || 'Eres un asistente de atencion al cliente amable y profesional. Responde de forma breve y util. Empresa: ' + cliente.nombre;
+  }
+
+  var config = kvData.config;
+  var productos = kvData.productos || [];
+  var kvCliente = kvData.kvCliente;
+
+  // Construir lista de productos
+  var listaProductos = '';
+  if (productos.length > 0) {
+    listaProductos = '\n\nPRODUCTOS DISPONIBLES:\n';
+    productos.forEach(function(p) {
+      listaProductos += '- ' + p.nombre;
+      if (p.referencia) listaProductos += ' (Ref: ' + p.referencia + ')';
+      listaProductos += ' | Precio: $' + Number(p.precio).toLocaleString('es-CO');
+      if (p.tallas && p.tallas.length > 0) listaProductos += ' | Tallas: ' + p.tallas.join(', ');
+      if (p.colores && p.colores.length > 0) listaProductos += ' | Colores: ' + p.colores.join(', ');
+      if (p.stock !== null) listaProductos += ' | Stock: ' + (p.stock > 0 ? p.stock + ' unidades' : 'AGOTADO');
+      listaProductos += '\n';
+    });
+  }
+
+  var prompt = 'Eres ' + (config.nombre_bot || 'el asesor de ventas') + ' de ' + kvCliente.nombre_empresa + '.\n';
+  prompt += 'Descripcion del negocio: ' + (config.descripcion_negocio || 'Negocio colombiano') + '\n';
+  prompt += 'Tu tono debe ser: ' + (config.tono || 'amigable y profesional') + '\n';
+  prompt += listaProductos;
+  prompt += '\nINSTRUCCIONES CLAVE:\n';
+  prompt += '- Tu objetivo principal es cerrar ventas o agendar citas\n';
+  prompt += '- Siempre pregunta por talla, color o especificacion cuando aplique\n';
+  prompt += '- Si el producto esta AGOTADO, ofrece alternativas disponibles\n';
+  prompt += '- Responde en maximo 3 oraciones, de forma natural y humana\n';
+  prompt += '- Nunca digas que eres una IA o un bot\n';
+  if (config.instrucciones_cierre) prompt += '- ' + config.instrucciones_cierre + '\n';
+
+  return prompt;
+}
+
 async function generarRespuestaIA(mensaje, cliente) {
+  // Intentar obtener config del Kit de Ventas
+  var kvData = await obtenerConfigKV(cliente.telefono);
+  var systemPrompt = construirSystemPrompt(cliente, kvData);
+
   var response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -344,7 +461,7 @@ async function generarRespuestaIA(mensaje, cliente) {
     body: JSON.stringify({
       model: 'llama-3.1-8b-instant',
       messages: [
-        { role: 'system', content: cliente.prompt_ia || 'Eres un asistente de atencion al cliente amable y profesional. Responde de forma breve y util. Empresa: ' + cliente.nombre },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: mensaje }
       ],
       max_tokens: 300
